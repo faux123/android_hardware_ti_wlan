@@ -1,24 +1,44 @@
-/*
+ /*
  * SdioDrv.c
  *
- * Copyright (C) 2010 Texas Instruments, Inc. - http://www.ti.com/
+ * Copyright(c) 1998 - 2010 Texas Instruments. All rights reserved.
+ * All rights reserved.
  *
- * Contributed by Ohad Ben-Cohen <ohad@bencohen.org>
- * 
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as 
- * published by the Free Software Foundation version 2.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
  *
- * This program is distributed "as is" WITHOUT ANY WARRANTY of any
- * kind, whether express or implied; without even the implied warranty
- * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ *  * Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ *  * Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ *  * Neither the name Texas Instruments nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+
+/** \file SdioDrv.c
+*/
 
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/delay.h>
+#include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/platform_device.h>
 #include <linux/errno.h>
@@ -27,11 +47,11 @@
 #include <linux/mmc/host.h>
 #include <linux/mmc/sdio_ids.h>
 #include <linux/mmc/sdio_func.h>
-#include <mach/omap4-common.h>
 
 #include "SdioDrvDbg.h"
 #include "SdioDrv.h"
 
+static DECLARE_COMPLETION(sdio_ready);
 
 typedef struct OMAP3430_sdiodrv
 {
@@ -45,16 +65,17 @@ typedef struct OMAP3430_sdiodrv
 	struct device *dev;
 	void		(*notify_sdio_ready)(void);
 	int			sdio_host_claim_ref;
+	struct work_struct sdio_opp_set_work;
+	struct timer_list inact_timer;
+	int    inact_timer_running;
 } OMAP3430_sdiodrv_t;
 
 int g_sdio_debug_level = SDIO_DEBUGLEVEL_ERR;
+extern int sdio_reset_comm(struct mmc_card *card);
+unsigned char *pElpData;
 
 static OMAP3430_sdiodrv_t g_drv;
 static struct sdio_func *tiwlan_func[1 + SDIO_TOTAL_FUNCS];
-
-static struct platform_device dummy_cpufreq_dev = {
-	.name = "wl1283_softap"
-};
 
 void sdioDrv_Register_Notification(void (*notify_sdio_ready)(void))
 {
@@ -65,6 +86,32 @@ void sdioDrv_Register_Notification(void (*notify_sdio_ready)(void))
 	 * If so, notify its existence to the WLAN driver */
 	if (tiwlan_func[SDIO_WLAN_FUNC] && g_drv.notify_sdio_ready)
 			g_drv.notify_sdio_ready();
+}
+
+static void sdioDrv_inact_timer(unsigned long data)
+{
+	g_drv.inact_timer_running = 0;
+	schedule_work(&g_drv.sdio_opp_set_work);
+}
+
+void sdioDrv_start_inact_timer(void)
+{
+	mod_timer(&g_drv.inact_timer, jiffies + msecs_to_jiffies(1000));
+	g_drv.inact_timer_running = 1;
+}
+
+void sdioDrv_cancel_inact_timer(void)
+{
+	if(g_drv.inact_timer_running) {
+		del_timer_sync(&g_drv.inact_timer);
+		g_drv.inact_timer_running = 0;
+	}
+	cancel_work_sync(&g_drv.sdio_opp_set_work);
+}
+
+static void sdioDrv_opp_setup(struct work_struct *work)
+{
+	sdioDrv_ReleaseHost(SDIO_WLAN_FUNC);
 }
 
 void sdioDrv_ClaimHost(unsigned int uFunc)
@@ -78,9 +125,6 @@ void sdioDrv_ClaimHost(unsigned int uFunc)
 
 	g_drv.sdio_host_claim_ref = 1;
 
-	/* Call to block DPLL when softAP is in use */
-	dpll_cascading_blocker_hold(&dummy_cpufreq_dev.dev);
-
 	sdio_claim_host(tiwlan_func[uFunc]);
 }
 
@@ -93,13 +137,9 @@ void sdioDrv_ReleaseHost(unsigned int uFunc)
 	BUG_ON(uFunc != SDIO_WLAN_FUNC);
 	BUG_ON(tiwlan_func[uFunc] == NULL);
 
-
 	g_drv.sdio_host_claim_ref = 0;
 
 	sdio_release_host(tiwlan_func[uFunc]);
-
-	/* Release DPLL cascading blockers when we are done with softAP */
-	dpll_cascading_blocker_release(&dummy_cpufreq_dev.dev);
 }
 
 int sdioDrv_ConnectBus(void *fCbFunc,
@@ -109,17 +149,14 @@ int sdioDrv_ConnectBus(void *fCbFunc,
 {
 	g_drv.BusTxnCB      = fCbFunc;
 	g_drv.BusTxnHandle  = hCbArg;
-	g_drv.uBlkSizeShift = uBlkSizeShift;  
+	g_drv.uBlkSizeShift = uBlkSizeShift;
 	g_drv.uBlkSize      = 1 << uBlkSizeShift;
-
-	sdioDrv_ClaimHost(SDIO_WLAN_FUNC);
 
 	return 0;
 }
 
 int sdioDrv_DisconnectBus(void)
 {
-	sdioDrv_ReleaseHost(SDIO_WLAN_FUNC);
 
 	return 0;
 }
@@ -134,7 +171,7 @@ static int generic_read_bytes(unsigned int uFunc, unsigned int uHwAddr,
 	PDEBUG("%s: uFunc %d uHwAddr %d pData %x uLen %d bIncAddr %d\n", __func__, uFunc, uHwAddr, (unsigned int)pData, uLen, bIncAddr);
 
 	BUG_ON(uFunc != SDIO_CTRL_FUNC && uFunc != SDIO_WLAN_FUNC);
-	
+
 	for (i = 0; i < uLen; i++) {
 		if (uFunc == 0)
 			*pData = sdio_f0_readb(tiwlan_func[uFunc], uHwAddr, &ret);
@@ -160,14 +197,24 @@ static int generic_write_bytes(unsigned int uFunc, unsigned int uHwAddr,
 {
 	unsigned int i;
 	int ret;
+	unsigned int defFunc;
 
 	PDEBUG("%s: uFunc %d uHwAddr %d pData %x uLen %d\n", __func__, uFunc, uHwAddr, (unsigned int) pData, uLen);
 
 	BUG_ON(uFunc != SDIO_CTRL_FUNC && uFunc != SDIO_WLAN_FUNC);
 
 	for (i = 0; i < uLen; i++) {
-		if (uFunc == 0)
-			sdio_f0_writeb(tiwlan_func[uFunc], *pData, uHwAddr, &ret);
+		if (uFunc == 0) {
+			/* sdio_f0_writeb(tiwlan_func[uFunc], *pData, uHwAddr, &ret); */
+			/* WorkAround:
+			 * Using sdio_writeb API for bypassing address out of range issue.
+			 * Simulating function number to 0 and then restoring it back
+			 */
+			defFunc = tiwlan_func[uFunc]->num;
+			tiwlan_func[uFunc]->num = 0;
+			sdio_writeb(tiwlan_func[uFunc], *pData, uHwAddr, &ret);
+			tiwlan_func[uFunc]->num = defFunc;
+		}
 		else
 			sdio_writeb(tiwlan_func[uFunc], *pData, uHwAddr, &ret);
 
@@ -184,9 +231,9 @@ static int generic_write_bytes(unsigned int uFunc, unsigned int uHwAddr,
 	return 0;
 }
 
-int sdioDrv_ReadSync(unsigned int uFunc, 
-                      unsigned int uHwAddr, 
-                      void *pData, 
+int sdioDrv_ReadSync(unsigned int uFunc,
+                      unsigned int uHwAddr,
+                      void *pData,
                       unsigned int uLen,
                       unsigned int bIncAddr,
                       unsigned int bMore)
@@ -217,10 +264,10 @@ int sdioDrv_ReadSync(unsigned int uFunc,
 	return 0;
 }
 
-int sdioDrv_ReadAsync(unsigned int uFunc, 
-                       unsigned int uHwAddr, 
-                       void *pData, 
-                       unsigned int uLen, 
+int sdioDrv_ReadAsync(unsigned int uFunc,
+                       unsigned int uHwAddr,
+                       void *pData,
+                       unsigned int uLen,
                        unsigned int bBlkMode,
                        unsigned int bIncAddr,
                        unsigned int bMore)
@@ -230,9 +277,9 @@ int sdioDrv_ReadAsync(unsigned int uFunc,
 	return -1;
 }
 
-int sdioDrv_WriteSync(unsigned int uFunc, 
-                       unsigned int uHwAddr, 
-                       void *pData, 
+int sdioDrv_WriteSync(unsigned int uFunc,
+                       unsigned int uHwAddr,
+                       void *pData,
                        unsigned int uLen,
                        unsigned int bIncAddr,
                        unsigned int bMore)
@@ -263,10 +310,10 @@ int sdioDrv_WriteSync(unsigned int uFunc,
 	return 0;
 }
 
-int sdioDrv_WriteAsync(unsigned int uFunc, 
-                        unsigned int uHwAddr, 
-                        void *pData, 
-                        unsigned int uLen, 
+int sdioDrv_WriteAsync(unsigned int uFunc,
+                        unsigned int uHwAddr,
+                        void *pData,
+                        unsigned int uLen,
                         unsigned int bBlkMode,
                         unsigned int bIncAddr,
                         unsigned int bMore)
@@ -276,10 +323,10 @@ int sdioDrv_WriteAsync(unsigned int uFunc,
 	return -1;
 }
 
-int sdioDrv_ReadSyncBytes(unsigned int uFunc, 
-                           unsigned int uHwAddr, 
-                           unsigned char *pData, 
-                           unsigned int uLen, 
+int sdioDrv_ReadSyncBytes(unsigned int uFunc,
+                           unsigned int uHwAddr,
+                           unsigned char *pData,
+                           unsigned int uLen,
                            unsigned int bMore)
 {
 	PDEBUG("%s: uFunc %d uHwAddr %d pData %x uLen %d\n", __func__, uFunc, uHwAddr, (unsigned int)pData, uLen);
@@ -287,10 +334,10 @@ int sdioDrv_ReadSyncBytes(unsigned int uFunc,
 	return generic_read_bytes(uFunc, uHwAddr, pData, uLen, 1, bMore);
 }
 
-int sdioDrv_WriteSyncBytes(unsigned int uFunc, 
-                            unsigned int uHwAddr, 
-                            unsigned char *pData, 
-                            unsigned int uLen, 
+int sdioDrv_WriteSyncBytes(unsigned int uFunc,
+                            unsigned int uHwAddr,
+                            unsigned char *pData,
+                            unsigned int uLen,
                             unsigned int bMore)
 {
 	PDEBUG("%s: uFunc %d uHwAddr %d pData %x uLen %d\n", __func__, uFunc, uHwAddr, (unsigned int) pData, uLen);
@@ -309,7 +356,7 @@ int sdioDrv_DisableFunction(unsigned int uFunc)
 	/* currently only wlan sdio function is supported */
 	BUG_ON(uFunc != SDIO_WLAN_FUNC);
 	BUG_ON(tiwlan_func[uFunc] == NULL);
-	
+
 	return sdio_disable_func(tiwlan_func[uFunc]);
 }
 
@@ -320,7 +367,7 @@ int sdioDrv_EnableFunction(unsigned int uFunc)
 	/* currently only wlan sdio function is supported */
 	BUG_ON(uFunc != SDIO_WLAN_FUNC);
 	BUG_ON(tiwlan_func[uFunc] == NULL);
-	
+
 	return sdio_enable_func(tiwlan_func[uFunc]);
 }
 
@@ -361,7 +408,7 @@ static int tiwlan_sdio_probe(struct sdio_func *func, const struct sdio_device_id
 {
 	PDEBUG("TIWLAN: probed with vendor 0x%x, device 0x%x, class 0x%x\n",
            func->vendor, func->device, func->class);
-
+	printk(KERN_INFO "TIWLAN: tiwlan_sdio_probe +++\n");
 	if (func->vendor != SDIO_VENDOR_ID_TI ||
 		func->device != SDIO_DEVICE_ID_TI_WL12xx ||
 		func->class != SDIO_CLASS_WLAN)
@@ -375,14 +422,21 @@ static int tiwlan_sdio_probe(struct sdio_func *func, const struct sdio_device_id
 
 	if (g_drv.notify_sdio_ready)
 		g_drv.notify_sdio_ready();
-	
+
+	init_timer(&g_drv.inact_timer);
+	g_drv.inact_timer.function = sdioDrv_inact_timer;
+	g_drv.inact_timer_running = 0;
+	INIT_WORK(&g_drv.sdio_opp_set_work, sdioDrv_opp_setup);
+	printk(KERN_INFO "TIWLAN: tiwlan_sdio_probe ---\n");
 	return 0;
 }
 
 static void tiwlan_sdio_remove(struct sdio_func *func)
 {
 	PDEBUG("%s\n", __func__);
-	
+
+	sdioDrv_cancel_inact_timer();
+
 	tiwlan_func[SDIO_WLAN_FUNC] = NULL;
 	tiwlan_func[SDIO_CTRL_FUNC] = NULL;
 }
@@ -403,14 +457,43 @@ static const struct sdio_device_id tiwl12xx_devices[] = {
 
 MODULE_DEVICE_TABLE(sdio, tiwl12xx_devices);
 
-static struct sdio_driver tiwlan_sdio_drv = {
-    .probe          = tiwlan_sdio_probe,
-    .remove         = tiwlan_sdio_remove,
-    .name           = "sdio_tiwlan",
-    .id_table       = tiwl12xx_devices,
+int sdio_tiwlan_suspend(struct device *dev)
+{
+	return 0;
+}
+
+int sdio_tiwlan_resume(struct device *dev)
+{
+	/* Waking up the wifi chip for sdio_reset_comm */
+	*pElpData = 1;
+	sdioDrv_ClaimHost(SDIO_WLAN_FUNC);
+	generic_write_bytes(0, ELP_CTRL_REG_ADDR, pElpData, 1, 1, 0);
+	sdioDrv_ReleaseHost(SDIO_WLAN_FUNC);
+	//mdelay(5);
+
+	/* Configuring the host and chip back to maximum capability
+	 * (bus width and speed)
+	 */
+	sdio_reset_comm(tiwlan_func[SDIO_WLAN_FUNC]->card);
+	return 0;
+}
+
+const struct dev_pm_ops sdio_tiwlan_pmops = {
+	.suspend = sdio_tiwlan_suspend,
+	.resume = sdio_tiwlan_resume,
 };
 
-int __init sdioDrv_init(void)
+static struct sdio_driver tiwlan_sdio_drv = {
+	.probe          = tiwlan_sdio_probe,
+	.remove         = tiwlan_sdio_remove,
+	.name           = "sdio_tiwlan",
+	.id_table       = tiwl12xx_devices,
+	.drv = {
+		.pm     = &sdio_tiwlan_pmops,
+	 },
+};
+
+int sdioDrv_wlan_init(void)
 {
 	int ret;
 
@@ -420,12 +503,23 @@ int __init sdioDrv_init(void)
 
 	ret = sdio_register_driver(&tiwlan_sdio_drv);
 	if (ret < 0) {
-		printk(KERN_ERR "sdioDrv_init: sdio register failed: %d\n", ret);
-		goto out;
+		sdio_unregister_driver(&tiwlan_sdio_drv);
+		ret = sdio_register_driver(&tiwlan_sdio_drv);
+
+		if(ret < 0)
+		{
+		  printk(KERN_ERR "sdioDrv_init: sdio register failed: %d\n", ret);
+		  goto out;
+	    }
 	}
 
-	printk(KERN_INFO "TI WiLink 1283 SDIO: Driver loaded\n");
+	pElpData = kmalloc(sizeof (unsigned char), GFP_KERNEL);
+	if (!pElpData)
+		printk(KERN_ERR "Running out of memory\n");
 
+	printk(KERN_INFO "TI WiLink 1283 SDIO: Driver loaded\n");
+	printk("%s complete \n", __FUNCTION__);
+	complete(&sdio_ready);
 out:
 	return ret;
 }
@@ -434,13 +528,15 @@ void __exit sdioDrv_exit(void)
 {
 	sdio_unregister_driver(&tiwlan_sdio_drv);
 
+	if(pElpData);
+		kfree(pElpData);
 	printk(KERN_INFO "TI WiLink 1283 SDIO Driver unloaded\n");
 }
 
 
 module_param(g_sdio_debug_level, int, SDIO_DEBUGLEVEL_ERR);
 MODULE_PARM_DESC(g_sdio_debug_level, "TIWLAN SDIO debug level");
-
+#if 0
 EXPORT_SYMBOL(g_sdio_debug_level);
 EXPORT_SYMBOL(sdioDrv_ConnectBus);
 EXPORT_SYMBOL(sdioDrv_DisconnectBus);
@@ -456,7 +552,7 @@ EXPORT_SYMBOL(sdioDrv_DisableFunction);
 EXPORT_SYMBOL(sdioDrv_DisableInterrupt);
 EXPORT_SYMBOL(sdioDrv_SetBlockSize);
 EXPORT_SYMBOL(sdioDrv_Register_Notification);
-
+#endif
 MODULE_DESCRIPTION("TI WLAN 1283 SDIO interface");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS(SDIO_DRIVER_NAME);

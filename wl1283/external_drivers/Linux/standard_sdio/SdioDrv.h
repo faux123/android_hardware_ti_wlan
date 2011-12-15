@@ -73,9 +73,8 @@
 #define VDD_VOLTAGE_WINDOW                  0xffffc0
 #define ELP_CTRL_REG_ADDR                   0x1fffc
 
-/* The OPP values are different between OMAP 4430 and 4460 */
-#define OMAP443X_MPU_OPP_1GHZ               1008000000
-#define OMAP446X_MPU_OPP_1GHZ                920000000
+#define OMAP_MPU_OPP_1GHZ                   1008000000
+#define OMAP_MPU_OPP_300MHZ                 300000000
 
 /********************************************************************/
 /*	SDIO driver functions prototypes                                */
@@ -140,7 +139,7 @@ void sdioDrv_ClaimHost(unsigned int uFunc);
 void sdioDrv_start_inact_timer(void);
 void sdioDrv_cancel_inact_timer(void);
 
-int sdioDrv_init(void);
+int sdioDrv_wlan_init(void);
 void sdioDrv_exit(void);
 
 #endif/* _OMAP3430_SDIODRV_H */

@@ -1079,7 +1079,7 @@ static void wlanDrvIf_Destroy (TWlanDrvIfObj *drv)
 static int __init wlanDrvIf_ModuleInit (void)
 {
     printk(KERN_INFO "TIWLAN: driver init\n");
-	sdioDrv_init();
+	sdioDrv_wlan_init();
     return wlanDrvIf_Create ();
 }
 
